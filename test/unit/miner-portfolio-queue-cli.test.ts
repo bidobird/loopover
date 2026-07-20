@@ -14,6 +14,7 @@ import {
   parseQueueRequeueArgs,
   renderPortfolioQueueMetrics,
   renderQueueTable,
+  runQueueClaimBatch,
   runQueueCli,
   runQueueDone,
   runQueueList,
@@ -24,6 +25,7 @@ import {
   selectNextEligibleTarget,
 } from "../../packages/loopover-miner/lib/portfolio-queue-cli.js";
 import type { QueueEntry } from "../../packages/loopover-miner/lib/portfolio-queue.d.ts";
+import type { PortfolioQueueManager } from "../../packages/loopover-miner/lib/portfolio-queue-manager.js";
 
 const roots: string[] = [];
 const stores: Array<{ close(): void }> = [];
@@ -775,6 +777,64 @@ describe("loopover-miner portfolio queue CLI (#2292)", () => {
       portfolioQueue.markDone("acme/widgets", "issue:11");
       expect(runQueueCli("requeue", ["acme/widgets", "issue:11"], options)).toBe(0);
       expect(portfolioQueue.listQueue("acme/widgets")[0]?.status).toBe("queued");
+    });
+  });
+
+  describe("rarely-taken argv and rendering paths", () => {
+    it("queue list rejects a missing/flag-like/malformed --repo value and a stray positional", () => {
+      expect(parseQueueListArgs(["--repo"])).toEqual({ error: expect.stringContaining("Usage:") });
+      expect(parseQueueListArgs(["--repo", "-x"])).toEqual({ error: expect.stringContaining("Usage:") });
+      expect(parseQueueListArgs(["--repo", "a/b/c"])).toEqual({ error: "Repository must be in owner/repo form." });
+      expect(parseQueueListArgs(["stray"])).toEqual({ error: expect.stringContaining("Usage:") });
+    });
+
+    it("renderQueueTable prints '-' for a null/absent host, priority, and enqueued-at", () => {
+      const rendered = renderQueueTable([
+        {
+          repoFullName: "acme/widgets",
+          identifier: "issue:1",
+          apiBaseUrl: null,
+          status: "queued",
+          priority: null,
+          enqueuedAt: null,
+        },
+      ] as unknown as QueueEntry[]);
+      expect(rendered).toContain("acme/widgets");
+      expect(rendered).toContain("-");
+    });
+
+    it("claim-batch lists each claimed identifier in text mode", () => {
+      const manager = {
+        claimNextBatch: () => [
+          { repoFullName: "acme/widgets", identifier: "issue:1", apiBaseUrl: "", priority: 0, status: "in_progress", enqueuedAt: "" },
+          { repoFullName: "acme/other", identifier: "issue:2", apiBaseUrl: "", priority: 0, status: "in_progress", enqueuedAt: "" },
+        ],
+        close: vi.fn(),
+      };
+      const logs: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((msg?: unknown) => {
+        logs.push(String(msg));
+      });
+      const exitCode = runQueueClaimBatch([], {
+        initPortfolioQueueManager: () => manager as unknown as PortfolioQueueManager,
+      });
+      spy.mockRestore();
+      expect(exitCode).toBe(0);
+      expect(logs.join("")).toBe("issue:1\nissue:2");
+      // The injected manager is caller-owned: runQueueClaimBatch must not close it.
+      expect(manager.close).not.toHaveBeenCalled();
+    });
+
+    it("runQueueCli dispatches claim-batch, metrics, and dashboard, and reports an undefined subcommand", () => {
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      expect(runQueueCli("claim-batch", ["--dry-run"], {})).toBe(0);
+      const portfolioQueue = tempQueueStore();
+      expect(runQueueCli("metrics", [], { initPortfolioQueue: () => portfolioQueue })).toBe(0);
+      // An unknown dashboard flag fails its own argv parse before any store is opened.
+      expect(runQueueCli("dashboard", ["--bogus"], {})).toBe(2);
+      expect(runQueueCli(undefined, [], {})).toBe(2);
+      expect(String(errSpy.mock.calls.at(-1)?.[0])).toContain("Unknown queue subcommand: .");
     });
   });
 });

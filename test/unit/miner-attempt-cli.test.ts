@@ -1935,3 +1935,138 @@ describe("runAttempt: hosted soft-claim submission (#7168)", () => {
     expect(exitCode).toBe(7);
   });
 });
+
+describe("runAttempt: remaining dispatch and deps seams", () => {
+  it("wires runSlopAssessment and fetchLiveIssueSnapshot through to the real implementations", async () => {
+    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
+    closeables.push(allocator, claimLedger, eventLedger, attemptLog, governorLedger);
+    const deps = buildAttemptDeps(
+      { MINER_CODING_AGENT_PROVIDER: "noop", GITHUB_TOKEN: "test-token" },
+      { claimLedger, eventLedger, attemptLog, governorLedger, nowMs: 1 },
+    );
+
+    // The real slop assessor returns a real scored band -- proof the arrow reaches it, whatever the score.
+    const assessment = deps.runSlopAssessment({
+      changedFiles: [{ path: "src/widget.ts", additions: 1, deletions: 0 }],
+      description: "adds one covered line, with tests",
+      tests: true,
+    }) as { band: string; slopRisk: number };
+    expect(["clean", "low", "elevated", "high"]).toContain(assessment.band);
+    expect(typeof assessment.slopRisk).toBe("number");
+
+    // The real snapshot fetcher hits (stubbed) fetch with the resolved token -- proof the arrow reaches it.
+    const fetchSpy = vi.fn(async () =>
+      Response.json({ data: { repository: { issue: { number: 7, title: "t", body: "b", state: "OPEN", labels: { nodes: [] }, timelineItems: { nodes: [] } } } } }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    await deps.fetchLiveIssueSnapshot("acme/widgets", 7);
+    vi.unstubAllGlobals();
+    expect(fetchSpy).toHaveBeenCalled();
+
+    // The real local-write executor resolves (never rejects) with a structured result -- proof the arrow
+    // reaches it; a harmless read-only command keeps the test hermetic on any host.
+    const writeResult = await deps.executeLocalWrite({
+      action: "probe",
+      description: "harmless read-only probe",
+      inputs: {},
+      command: "git --version",
+      boundary: "test",
+    });
+    expect(writeResult).toHaveProperty("code");
+  });
+
+  it("reports an infeasible verdict as plain text and uses the inert placeholder when the target issue is absent from the context", async () => {
+    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const exitCode = await runAttempt(["acme/widgets", "7", "--miner-login", "alice"], {
+      env: { MINER_CODING_AGENT_PROVIDER: "noop" },
+      openWorktreeAllocator: () => allocator,
+      openClaimLedger: () => claimLedger,
+      initEventLedger: () => eventLedger,
+      initAttemptLog: () => attemptLog,
+      initGovernorLedger: () => governorLedger,
+      ...readyPipelineOptions({
+        // No target issue in the fetched context at all: the placeholder shape feeds the feasibility check,
+        // which reports target_not_found, and the empty title/body never surface anywhere.
+        fetchSelfReviewContext: async () => ({ ...fakeReviewContext(), issues: [] }),
+        buildCodingTaskSpec: () => ({
+          ready: false,
+          verdict: "raise",
+          feasibility: { verdict: "raise", avoidReasons: [], raiseReasons: ["target_not_found"], summary: "issue not found" },
+        }),
+      }),
+    });
+
+    expect(exitCode).toBe(4);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('feasibility verdict "raise" (target_not_found)'));
+  });
+
+  it("falls back to the REAL policy, goal-spec, and kill-switch resolvers when none are injected", async () => {
+    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const {
+      resolveAmsPolicy: _omittedPolicy,
+      resolveMinerGoalSpec: _omittedGoalSpec,
+      checkMinerKillSwitch: _omittedKillSwitch,
+      ...injectedRest
+    } = readyPipelineOptions({
+      runMinerAttempt: async () => ({ outcome: "abandon", loopResult: fakeLoopResult() }),
+    });
+
+    // The real resolveAmsPolicy reads no config here (defaults), the real resolveMinerGoalSpec degrades on the
+    // fake worktree path without throwing, and the real checkMinerKillSwitch sees no env flag -- all hermetic.
+    const exitCode = await runAttempt(["acme/widgets", "7", "--miner-login", "alice", "--json"], {
+      env: { MINER_CODING_AGENT_PROVIDER: "noop" },
+      openWorktreeAllocator: () => allocator,
+      openClaimLedger: () => claimLedger,
+      initEventLedger: () => eventLedger,
+      initAttemptLog: () => attemptLog,
+      initGovernorLedger: () => governorLedger,
+      ...injectedRest,
+    });
+
+    expect(exitCode).toBe(7);
+  });
+
+  it("falls back to the REAL submitSoftClaim when the discovery plane is enabled but no hook is injected (no index URL -> silent no-op)", async () => {
+    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    // Plane ON but no LOOPOVER_MINER_DISCOVERY_INDEX_URL: the real submitSoftClaim resolves no base URL and
+    // returns without any network call -- both the work-start submission and the finally-block release run
+    // through the real default.
+    const exitCode = await runAttempt(["acme/widgets", "7", "--miner-login", "alice", "--json"], {
+      env: { MINER_CODING_AGENT_PROVIDER: "noop", LOOPOVER_MINER_DISCOVERY_PLANE: "1" },
+      openWorktreeAllocator: () => allocator,
+      openClaimLedger: () => claimLedger,
+      initEventLedger: () => eventLedger,
+      initAttemptLog: () => attemptLog,
+      initGovernorLedger: () => governorLedger,
+      ...readyPipelineOptions({
+        runMinerAttempt: async () => ({ outcome: "abandon", loopResult: fakeLoopResult() }),
+      }),
+    });
+
+    expect(exitCode).toBe(7);
+  });
+
+  it("returns the generic exit code 2 for an unrecognized runMinerAttempt outcome", async () => {
+    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const exitCode = await runAttempt(["acme/widgets", "7", "--miner-login", "alice", "--json"], {
+      env: { MINER_CODING_AGENT_PROVIDER: "noop" },
+      openWorktreeAllocator: () => allocator,
+      openClaimLedger: () => claimLedger,
+      initEventLedger: () => eventLedger,
+      initAttemptLog: () => attemptLog,
+      initGovernorLedger: () => governorLedger,
+      ...readyPipelineOptions({
+        runMinerAttempt: async () => ({ outcome: "unrecognized_future_outcome", loopResult: fakeLoopResult() }),
+      }),
+    });
+
+    expect(exitCode).toBe(2);
+  });
+});

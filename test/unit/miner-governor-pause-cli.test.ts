@@ -102,6 +102,15 @@ describe("loopover-miner governor pause/resume/status CLI (#4851)", () => {
     expect(text).not.toContain("(");
   });
 
+  it("resume emits the persisted pause state as JSON with --json", async () => {
+    const governorState = tempGovernorState();
+    governorState.savePauseState({ paused: true, reason: "halting for review" });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await runGovernorResume(["--json"], { openGovernorState: () => governorState })).toBe(0);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({ paused: false });
+  });
+
   it("status reports the current pause state without mutating it", async () => {
     const governorState = tempGovernorState();
     governorState.savePauseState({ paused: true, reason: "halting for review" });

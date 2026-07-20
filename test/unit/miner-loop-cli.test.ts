@@ -146,6 +146,21 @@ describe("parseLoopArgs (#5135)", () => {
     });
   });
 
+  it("rejects a missing or flag-like value after each value-taking flag", () => {
+    expect(parseLoopArgs(["--search"])).toEqual({ error: expect.stringContaining("Usage:") });
+    expect(parseLoopArgs(["acme/widgets", "--miner-login"])).toEqual({ error: expect.stringContaining("Usage:") });
+    expect(parseLoopArgs(["acme/widgets", "--miner-login", "-x"])).toEqual({ error: expect.stringContaining("Usage:") });
+    expect(parseLoopArgs(["acme/widgets", "--miner-login", "alice", "--base"])).toEqual({
+      error: expect.stringContaining("Usage:"),
+    });
+    expect(parseLoopArgs(["acme/widgets", "--miner-login", "alice", "--max-cycles"])).toEqual({
+      error: expect.stringContaining("Usage:"),
+    });
+    expect(parseLoopArgs(["acme/widgets", "--miner-login", "alice", "--cycle-delay-ms"])).toEqual({
+      error: expect.stringContaining("Usage:"),
+    });
+  });
+
   it("rejects a non-integer or negative --max-cycles / --cycle-delay-ms", () => {
     expect(parseLoopArgs(["acme/widgets", "--miner-login", "alice", "--max-cycles", "abc"])).toHaveProperty("error");
     expect(parseLoopArgs(["acme/widgets", "--miner-login", "alice", "--max-cycles", "-1"])).toHaveProperty("error");
@@ -1082,5 +1097,127 @@ describe("runLoop (#5135)", () => {
     const printed = JSON.parse(String(log.mock.calls[0]?.[0]));
     expect(printed.haltReason).toBe("paused");
     expect(printed.cycles.at(-1)).toEqual({ cycle: 1, outcome: "halted", reason: "paused" });
+  });
+
+  it("--search mode threads the search argv into discovery, and a caps-less policy spec falls back to the default limits", async () => {
+    const { eventLedger, governorLedger, portfolioQueue, runState, governorState } = tempStores();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const item = { repoFullName: "acme/widgets", identifier: "issue:21" };
+    // A typed argv-capturing variant of primeOnceDiscover, so the assertion below can read the call's argv.
+    const runDiscoverSpy = vi.fn(async (_argv: string[]) => {
+      if (portfolioQueue.listQueue().length === 0) portfolioQueue.enqueue(item);
+      return 0;
+    });
+    // Never calls onResult: the loop's usage/outcome reads all take their nullish `??` fallbacks and the
+    // cycle records the honest "attempt_error" outcome instead of a fabricated one.
+    const runAttemptSpy = vi.fn(async (_args: string[]) => 2);
+
+    const exitCode = await runLoop(["--search", "label:good-first-issue", "--miner-login", "alice", "--max-cycles", "1", "--json"], {
+      openGovernorState: () => governorState,
+      initEventLedger: () => eventLedger,
+      initGovernorLedger: () => governorLedger,
+      initPortfolioQueue: () => portfolioQueue,
+      initRunStateStore: () => runState,
+      runDiscover: runDiscoverSpy,
+      runAttempt: runAttemptSpy,
+      ...readyLoopOptions({
+        // No capLimits/convergenceThresholds on the spec at all -- the boundary gate must fall back to
+        // DEFAULT_AMS_POLICY_SPEC's own values rather than crash or halt.
+        resolveAmsPolicy: async () => ({ spec: {}, source: "empty", warnings: [] }),
+      }),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runDiscoverSpy.mock.calls[0]?.[0]).toEqual(["--search", "label:good-first-issue"]);
+    expect(runAttemptSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("--live threads --live into the attempt argv", async () => {
+    const { eventLedger, governorLedger, portfolioQueue, runState, governorState } = tempStores();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const item = { repoFullName: "acme/widgets", identifier: "issue:22" };
+    const runDiscoverSpy = primeOnceDiscover(portfolioQueue, item);
+    const runAttemptSpy = vi.fn(async (_args: string[]) => 2);
+
+    const exitCode = await runLoop(["acme/widgets", "--miner-login", "alice", "--live", "--max-cycles", "1", "--json"], {
+      openGovernorState: () => governorState,
+      initEventLedger: () => eventLedger,
+      initGovernorLedger: () => governorLedger,
+      initPortfolioQueue: () => portfolioQueue,
+      initRunStateStore: () => runState,
+      runDiscover: runDiscoverSpy,
+      runAttempt: runAttemptSpy,
+      ...readyLoopOptions(),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runAttemptSpy.mock.calls[0]?.[0]).toEqual([
+      "acme/widgets",
+      "22",
+      "--miner-login",
+      "alice",
+      "--base",
+      "main",
+      "--live",
+    ]);
+  });
+
+  it("#4847: --dry-run prints the repo-target list in the human-readable message", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg?: unknown) => {
+      logs.push(String(msg));
+    });
+    const exitCode = await runLoop(["acme/widgets", "acme/other", "--miner-login", "alice", "--dry-run"], {});
+    expect(exitCode).toBe(0);
+    expect(logs.join("")).toContain("would run an autonomous loop against acme/widgets, acme/other for alice");
+  });
+
+  it("halts with reentry_declined (and prints the plain-text summary) when the reentry decision says stop", async () => {
+    const { eventLedger, governorLedger, portfolioQueue, runState, governorState } = tempStores();
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg?: unknown) => {
+      logs.push(String(msg));
+    });
+    const item = { repoFullName: "acme/widgets", identifier: "issue:23" };
+    const runDiscoverSpy = primeOnceDiscover(portfolioQueue, item);
+
+    const exitCode = await runLoop(["acme/widgets", "--miner-login", "alice"], {
+      openGovernorState: () => governorState,
+      initEventLedger: () => eventLedger,
+      initGovernorLedger: () => governorLedger,
+      initPortfolioQueue: () => portfolioQueue,
+      initRunStateStore: () => runState,
+      runDiscover: runDiscoverSpy,
+      runAttempt: vi.fn(async () => 2),
+      attemptLoopReentry: () => ({ decision: { reenter: false, reasons: ["session_wall_clock_reached"] }, dequeued: null }),
+      ...readyLoopOptions(),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(logs.join("")).toBe("Loop finished after 1 cycle(s): reentry_declined:session_wall_clock_reached.");
+  });
+
+  it("uses the real setTimeout-based sleep between cycles when no sleepFn is injected", async () => {
+    const { eventLedger, governorLedger, portfolioQueue, runState, governorState } = tempStores();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    // Empty queue throughout: the single allowed cycle takes the idle path, which awaits the REAL default
+    // sleep (0ms keeps it instant) before re-discovering, then max-cycles ends the run.
+    const exitCode = await runLoop(
+      ["acme/widgets", "--miner-login", "alice", "--max-cycles", "1", "--cycle-delay-ms", "0", "--json"],
+      {
+        openGovernorState: () => governorState,
+        initEventLedger: () => eventLedger,
+        initGovernorLedger: () => governorLedger,
+        initPortfolioQueue: () => portfolioQueue,
+        initRunStateStore: () => runState,
+        runDiscover: async () => 0,
+        runAttempt: vi.fn(),
+        resolveAmsPolicy: async () => ({ spec: DEFAULT_AMS_POLICY_SPEC, source: "default", warnings: [] }),
+        checkMinerKillSwitch: () => ({ scope: "none", active: false }),
+      },
+    );
+
+    expect(exitCode).toBe(0);
   });
 });
